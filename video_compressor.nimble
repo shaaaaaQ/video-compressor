@@ -9,7 +9,7 @@ bin           = @["video_compressor"]
 
 # Dependencies
 requires "nim >= 2.0.0"
-requires "uirelays == 0.8.0"
+requires "https://github.com/nim-lang/uirelays#a3d31e179d0a6d926e532442cfba2f6c5ab2b2d3"
 
 task buildRelease, "Build the native release executable":
   when defined(windows):
