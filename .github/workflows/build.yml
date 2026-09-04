@@ -14,6 +14,7 @@ jobs:
       - uses: jiro4989/setup-nim-action@v2
         with:
           nim-version: "2.2.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: nimble install -y uirelays@0.8.0
       - run: nimble buildRelease
       - name: Install Inno Setup
