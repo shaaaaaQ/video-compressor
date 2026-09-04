@@ -16,7 +16,14 @@ jobs:
           nim-version: "2.2.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: nimble install -y uirelays@0.8.0
-      - run: nimble buildRelease
+      - name: Build application
+        run: nimble buildRelease
+      - name: Verify application output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath 'bin/video-compressor.exe' -PathType Leaf)) {
+            throw 'bin/video-compressor.exe was not generated'
+          }
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
       - name: Build installer

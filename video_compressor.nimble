@@ -13,7 +13,7 @@ requires "uirelays == 0.8.0"
 
 task buildRelease, "Build the native release executable":
   when defined(windows):
-    exec "nim c --threads:on --mm:orc --app:gui -d:release --nimcache:nimcache -o:bin/video-compressor src/video_compressor.nim"
+    exec "nim c --threads:on --mm:orc --app:gui -d:release --nimcache:nimcache -o:bin/video-compressor.exe src/video_compressor.nim"
   else:
     exec "nim c --threads:on --mm:orc -d:release --nimcache:nimcache -o:bin/video-compressor src/video_compressor.nim"
 
