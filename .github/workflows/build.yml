@@ -15,7 +15,7 @@ jobs:
         with:
           nim-version: "2.2.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: nimble install -y uirelays@0.8.0
+      - run: nimble install -y "https://github.com/nim-lang/uirelays#a3d31e179d0a6d926e532442cfba2f6c5ab2b2d3"
       - run: nimble buildRelease
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
