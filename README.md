@@ -9,7 +9,7 @@
 ## ビルド
 
 ```powershell
-nimble install -y uirelays@0.8.0
+nimble install -d -y
 nimble buildRelease
 ```
 
