@@ -1,0 +1,7 @@
+bin/*
+!bin/.gitkeep
+nimcache/
+*.exe
+*.pdb
+*.ilk
+.DS_Store

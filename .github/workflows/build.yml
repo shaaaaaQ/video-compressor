@@ -1,0 +1,31 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.x"
+      - run: nimble install -y uirelays@0.8.0
+      - run: nimble buildRelease
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        shell: pwsh
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\video-compressor.iss'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-compressor-windows-x64
+          path: |
+            bin/video-compressor.exe
+            dist/video-compressor-setup-*-windows-x64.exe
+            LICENSE
+            THIRD_PARTY_NOTICES.txt
