@@ -1,5 +1,5 @@
 # Package
-version       = "0.1.0"
+version       = "0.1.1"
 author        = "shaaaaaQ"
 description   = "A native video compressor built with Nim, uirelays, and local FFmpeg"
 license       = "MIT-0"
