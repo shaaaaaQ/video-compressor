@@ -18,11 +18,17 @@ const
   Danger = color(181, 59, 54)
 
 type
+  CompressionMode = enum
+    TargetSizeMode, ManualMode
+
   Job = object
     inputPath: string
     outputPath: string
     duration: float
+    mode: CompressionMode
     targetMb: int
+    videoKbps: int
+    audioKbps: int
     audioEnabled: bool
     targetFps: float
 
@@ -42,8 +48,14 @@ type
     inputBytes: int64
     duration: float
     sourceFps: float
+    sourceVideoKbps: int
+    sourceAudioKbps: int
+    sourceHasAudio: bool
     targetFps: float
     targetMb: int
+    mode: CompressionMode
+    manualVideoKbps: int
+    manualAudioKbps: int
     audioEnabled: bool
     progress: float
     status: string
@@ -55,11 +67,13 @@ type
     mouseY: int
 
   DragTarget = enum
-    NoDrag, TargetSizeDrag, FrameRateDrag
+    NoDrag, TargetSizeDrag, ManualVideoDrag, ManualAudioDrag, FrameRateDrag
 
   UiRects = object
     selectFile, openOutput, compress, cancel: Rect
-    targetSlider, fpsSlider, audioToggle: Rect
+    targetTab, manualTab: Rect
+    targetSlider, manualVideoSlider, manualAudioSlider: Rect
+    targetFpsSlider, manualFpsSlider, targetAudioToggle, manualAudioToggle: Rect
     preset20, preset50: Rect
 
 var
@@ -93,6 +107,12 @@ proc formatBytes(bytes: int64): string =
     &"{float(bytes) / 1024.0:.1f} KB"
   else:
     &"{float(bytes) / 1024.0 / 1024.0:.2f} MB"
+
+proc estimatedOutputBytes(duration: float; videoKbps, audioKbps: int;
+                          audioEnabled: bool): int64 =
+  if duration <= 0: return 0
+  let totalKbps = videoKbps + (if audioEnabled: audioKbps else: 0)
+  int64(float(totalKbps) * 1000.0 / 8.0 * duration * 1.03)
 
 proc truncateMiddle(value: string; maxChars: int): string =
   let charCount = value.runeLen
@@ -195,6 +215,10 @@ proc formatFps(fps: float): string =
   if abs(fps - round(fps)) < 0.01: $(int(round(fps)))
   else: &"{fps:.2f}"
 
+proc sourceBitrateText(kbps: int): string =
+  if kbps > 0: $kbps & " kbps"
+  else: "不明"
+
 proc outputPathFor(inputPath: string): string =
   let parts = splitFile(inputPath)
   var candidate = parts.dir / (parts.name & "-compressed.mp4")
@@ -211,27 +235,46 @@ proc parseFrameRate(value: string): float =
     if denominator != 0: return parseFloat(parts[0]) / denominator
   parseFloat(value)
 
-proc probeVideo(path: string): tuple[duration, fps: float, error: string] =
+proc probeVideo(path: string): tuple[duration, fps: float; videoKbps, audioKbps: int;
+                                    hasAudio: bool; error: string] =
   try:
     let raw = execProcess("ffprobe", args = ["-v", "error", "-show_entries",
-      "format=duration:stream=codec_type,avg_frame_rate", "-of", "json", path],
+      "format=duration,bit_rate:stream=codec_type,avg_frame_rate,bit_rate", "-of", "json", path],
       options = {poUsePath, poStdErrToStdOut, poDaemon})
     let doc = parseJson(raw)
     if not doc.hasKey("format") or not doc["format"].hasKey("duration"):
-      return (0.0, 0.0, "動画の長さを取得できませんでした。")
+      return (0.0, 0.0, 0, 0, false, "動画の長さを取得できませんでした。")
     let duration = parseFloat(doc["format"]["duration"].getStr())
-    if duration <= 0: return (0.0, 0.0, "動画の長さが不正です。")
+    if duration <= 0: return (0.0, 0.0, 0, 0, false, "動画の長さが不正です。")
     var fps = 30.0
+    var videoKbps = 0
+    var audioKbps = 0
+    var hasAudio = false
     if doc.hasKey("streams"):
       for stream in doc["streams"]:
-        if stream.hasKey("codec_type") and stream["codec_type"].getStr() == "video" and
-           stream.hasKey("avg_frame_rate"):
-          fps = parseFrameRate(stream["avg_frame_rate"].getStr())
-          break
+        if not stream.hasKey("codec_type"): continue
+        let codecType = stream["codec_type"].getStr()
+        if codecType == "video":
+          if stream.hasKey("avg_frame_rate"):
+            fps = parseFrameRate(stream["avg_frame_rate"].getStr())
+          if stream.hasKey("bit_rate"):
+            try: videoKbps = parseInt(stream["bit_rate"].getStr()) div 1000
+            except ValueError: discard
+        elif codecType == "audio":
+          hasAudio = true
+          if stream.hasKey("bit_rate"):
+            try: audioKbps = parseInt(stream["bit_rate"].getStr()) div 1000
+            except ValueError: discard
+    if videoKbps <= 0 and doc["format"].hasKey("bit_rate"):
+      try:
+        let totalKbps = parseInt(doc["format"]["bit_rate"].getStr()) div 1000
+        videoKbps = max(0, totalKbps - audioKbps)
+      except ValueError:
+        discard
     if fps <= 0 or fps > 1000: fps = 30.0
-    (duration, fps, "")
+    (duration, fps, videoKbps, audioKbps, hasAudio, "")
   except CatchableError as error:
-    (0.0, 0.0, "ffprobeエラー: " & error.msg)
+    (0.0, 0.0, 0, 0, false, "ffprobeエラー: " & error.msg)
 
 proc chooseVideoFile(): string =
   when defined(windows):
@@ -278,7 +321,7 @@ proc sendUpdate(kind: UpdateKind; progress: float; message: string;
 
 proc encodingSettings(duration: float; targetMb: int; audioEnabled: bool;
                       factor: float):
-    tuple[videoKbps, audioKbps, maxHeight: int] =
+    tuple[videoKbps, audioKbps: int] =
   let totalKbps = (float(targetMb) * 1024.0 * 1024.0 * 8.0 / duration / 1000.0) * 0.94 * factor
   result.audioKbps =
     if not audioEnabled: 0
@@ -286,18 +329,15 @@ proc encodingSettings(duration: float; targetMb: int; audioEnabled: bool;
     elif totalKbps >= 500: 96
     else: 64
   result.videoKbps = int(floor(totalKbps - float(result.audioKbps)))
-  result.maxHeight =
-    if result.videoKbps < 350: 360
-    elif result.videoKbps < 750: 480
-    elif result.videoKbps < 1600: 720
-    else: 1080
 
 proc runFfmpeg(job: Job; factor: float): tuple[exitCode: int, cancelled: bool] =
-  let settings = encodingSettings(job.duration, job.targetMb, job.audioEnabled, factor)
-  if settings.videoKbps < 120: return (-2, false)
-  let maxWidth = settings.maxHeight * 16 div 9
-  let scale = &"scale=w='min(iw,{maxWidth})':h='min(ih,{settings.maxHeight})':force_original_aspect_ratio=decrease:force_divisible_by=2"
-  let filters = &"fps={job.targetFps:.3f}," & scale
+  let settings =
+    if job.mode == TargetSizeMode:
+      encodingSettings(job.duration, job.targetMb, job.audioEnabled, factor)
+    else:
+      (videoKbps: job.videoKbps, audioKbps: job.audioKbps)
+  if job.mode == TargetSizeMode and settings.videoKbps < 120: return (-2, false)
+  let filters = &"fps={job.targetFps:.3f},scale=trunc(iw/2)*2:trunc(ih/2)*2"
   var args = @["-y", "-nostdin", "-i", job.inputPath, "-map", "0:v:0"]
   if job.audioEnabled:
     args.add ["-map", "0:a:0?"]
@@ -337,6 +377,18 @@ proc runFfmpeg(job: Job; factor: float): tuple[exitCode: int, cancelled: bool] =
     result.exitCode = -1
 
 proc compressWorker(job: Job) {.thread.} =
+  if job.mode == ManualMode:
+    let run = runFfmpeg(job, 1.0)
+    if run.cancelled:
+      if fileExists(job.outputPath): removeFile(job.outputPath)
+      sendUpdate(CancelledUpdate, 0, "キャンセルしました")
+    elif run.exitCode != 0 or not fileExists(job.outputPath):
+      sendUpdate(FailedUpdate, 0, "ffmpegでの圧縮に失敗しました")
+    else:
+      sendUpdate(CompletedUpdate, 1, "圧縮が完了しました", job.outputPath,
+        getFileSize(job.outputPath))
+    return
+
   let limitBytes = int64(job.targetMb) * 1024'i64 * 1024'i64
   var factor = 1.0
   for attempt in 0 .. 2:
@@ -370,21 +422,28 @@ proc computeRects(width, height: int): UiRects =
   let right = left + contentW
   result.selectFile = rect(left + 24, 92, 150, 42)
   result.openOutput = rect(right - 172, 92, 148, 42)
-  result.targetSlider = rect(left + 24, 239, contentW - 230, 28)
-  result.fpsSlider = rect(left + 24, 321, contentW - 210, 28)
-  result.audioToggle = rect(right - 150, 371, 126, 38)
+  result.targetTab = rect(left + 24, 190, 132, 32)
+  result.manualTab = rect(left + 164, 190, 132, 32)
+  result.targetSlider = rect(left + 24, 264, contentW - 230, 28)
+  result.manualVideoSlider = rect(left + 24, 258, contentW - 48, 28)
+  result.manualAudioSlider = rect(left + 24, 312, contentW - 210, 28)
+  result.targetFpsSlider = rect(left + 24, 326, contentW - 48, 28)
+  result.manualFpsSlider = rect(left + 24, 366, contentW - 48, 28)
+  result.targetAudioToggle = rect(right - 150, 367, 126, 38)
+  result.manualAudioToggle = rect(right - 150, 302, 126, 38)
   let presetX = right - 172
-  result.preset20 = rect(presetX, 229, 70, 36)
-  result.preset50 = rect(presetX + 78, 229, 70, 36)
+  result.preset20 = rect(presetX, 254, 70, 36)
+  result.preset50 = rect(presetX + 78, 254, 70, 36)
   result.compress = rect(left + 24, height - 72, contentW - 48, 50)
   result.cancel = rect(right - 144, 523, 120, 34)
 
 proc startJob(state: var AppState; worker: var Thread[Job]) =
   if state.inputPath.len == 0 or state.busy: return
-  let settings = encodingSettings(state.duration, state.targetMb, state.audioEnabled, 1.0)
-  if settings.videoKbps < 120:
-    state.status = "目標サイズが小さすぎます"
-    return
+  if state.mode == TargetSizeMode:
+    let settings = encodingSettings(state.duration, state.targetMb, state.audioEnabled, 1.0)
+    if settings.videoKbps < 120:
+      state.status = "目標サイズが小さすぎます"
+      return
   state.outputPath = outputPathFor(state.inputPath)
   state.busy = true
   state.completed = false
@@ -392,7 +451,9 @@ proc startJob(state: var AppState; worker: var Thread[Job]) =
   state.status = "ffmpegを開始しています"
   cancelRequested.store(false)
   createThread(worker, compressWorker, Job(inputPath: state.inputPath,
-    outputPath: state.outputPath, duration: state.duration, targetMb: state.targetMb,
+    outputPath: state.outputPath, duration: state.duration, mode: state.mode,
+    targetMb: state.targetMb, videoKbps: state.manualVideoKbps,
+    audioKbps: state.manualAudioKbps,
     audioEnabled: state.audioEnabled, targetFps: state.targetFps))
 
 proc loadVideo(state: var AppState; path: string) =
@@ -409,10 +470,16 @@ proc loadVideo(state: var AppState; path: string) =
   state.inputBytes = getFileSize(path)
   state.duration = probe.duration
   state.sourceFps = probe.fps
+  state.sourceVideoKbps = probe.videoKbps
+  state.sourceAudioKbps = probe.audioKbps
+  state.sourceHasAudio = probe.hasAudio
+  state.audioEnabled = probe.hasAudio
   state.targetFps = probe.fps
   state.completed = false
   state.progress = 0
-  state.status = "目標サイズを設定してください"
+  state.status =
+    if state.mode == TargetSizeMode: "目標サイズを設定してください"
+    else: "ビットレートとフレームレートを設定してください"
 
 proc selectFile(state: var AppState) =
   let path = chooseVideoFile()
@@ -432,15 +499,33 @@ proc handleClick(state: var AppState; ui: UiRects; x, y: int;
     cancelRequested.store(true)
     state.status = "キャンセルしています"
   elif not state.busy:
-    if ui.targetSlider.contains(p):
+    if ui.targetTab.contains(p):
+      state.mode = TargetSizeMode
+      if state.inputPath.len > 0: state.status = "目標サイズを設定してください"
+    elif ui.manualTab.contains(p):
+      state.mode = ManualMode
+      if state.inputPath.len > 0: state.status = "ビットレートとフレームレートを設定してください"
+    elif state.mode == TargetSizeMode and ui.targetSlider.contains(p):
       state.targetMb = sliderValue(x, ui.targetSlider, 1, 500, 1)
       drag = TargetSizeDrag
-    elif ui.fpsSlider.contains(p) and state.inputPath.len > 0:
-      state.targetFps = fpsFromSlider(x, ui.fpsSlider, state.sourceFps)
+    elif state.mode == ManualMode and ui.manualVideoSlider.contains(p):
+      state.manualVideoKbps = sliderValue(x, ui.manualVideoSlider, 100, 12000, 100)
+      drag = ManualVideoDrag
+    elif state.mode == ManualMode and ui.manualAudioSlider.contains(p) and state.audioEnabled:
+      state.manualAudioKbps = sliderValue(x, ui.manualAudioSlider, 32, 320, 16)
+      drag = ManualAudioDrag
+    elif state.mode == TargetSizeMode and ui.targetFpsSlider.contains(p) and state.inputPath.len > 0:
+      state.targetFps = fpsFromSlider(x, ui.targetFpsSlider, state.sourceFps)
       drag = FrameRateDrag
-    elif ui.audioToggle.contains(p): state.audioEnabled = not state.audioEnabled
-    elif ui.preset20.contains(p): state.targetMb = 20
-    elif ui.preset50.contains(p): state.targetMb = 50
+    elif state.mode == ManualMode and ui.manualFpsSlider.contains(p) and state.inputPath.len > 0:
+      state.targetFps = fpsFromSlider(x, ui.manualFpsSlider, state.sourceFps)
+      drag = FrameRateDrag
+    elif state.mode == TargetSizeMode and ui.targetAudioToggle.contains(p) and state.sourceHasAudio:
+      state.audioEnabled = not state.audioEnabled
+    elif state.mode == ManualMode and ui.manualAudioToggle.contains(p) and state.sourceHasAudio:
+      state.audioEnabled = not state.audioEnabled
+    elif state.mode == TargetSizeMode and ui.preset20.contains(p): state.targetMb = 20
+    elif state.mode == TargetSizeMode and ui.preset50.contains(p): state.targetMb = 50
     state.targetMb = clamp(state.targetMb, 1, 500)
     state.completed = false
 
@@ -449,8 +534,15 @@ proc handleDrag(state: var AppState; ui: UiRects; x: int; drag: DragTarget) =
   if drag == TargetSizeDrag:
     state.targetMb = sliderValue(x, ui.targetSlider, 1, 500, 1)
     state.completed = false
+  elif drag == ManualVideoDrag:
+    state.manualVideoKbps = sliderValue(x, ui.manualVideoSlider, 100, 12000, 100)
+    state.completed = false
+  elif drag == ManualAudioDrag and state.audioEnabled:
+    state.manualAudioKbps = sliderValue(x, ui.manualAudioSlider, 32, 320, 16)
+    state.completed = false
   elif drag == FrameRateDrag and state.inputPath.len > 0:
-    state.targetFps = fpsFromSlider(x, ui.fpsSlider, state.sourceFps)
+    let slider = if state.mode == TargetSizeMode: ui.targetFpsSlider else: ui.manualFpsSlider
+    state.targetFps = fpsFromSlider(x, slider, state.sourceFps)
     state.completed = false
 
 proc drawUi(state: AppState; ui: UiRects; width, height: int;
@@ -489,27 +581,55 @@ proc drawUi(state: AppState; ui: UiRects; width, height: int;
   let sizeCard = rect(left, 174, contentW, 250)
   fillRect(sizeCard, Paper)
   drawBorder(sizeCard, Border)
-  discard drawText(titleFont, left + 24, 190, "目標サイズ", Ink, Paper)
-  let sizeLabelWidth = measureText(titleFont, "目標サイズ").w
-  discard drawText(titleFont, left + 24 + sizeLabelWidth + 18, 190,
-    $state.targetMb & " MB 以下", Accent, Paper)
-  drawSlider(ui.targetSlider, state.targetMb, 1, 500, not state.busy)
-  for item in [(ui.preset20, 20), (ui.preset50, 50)]:
-    drawButton(font, fm, item[0], $item[1] & " MB", state.mouseX, state.mouseY,
-      not state.busy, selected = state.targetMb == item[1])
+  drawButton(font, fm, ui.targetTab, "目標サイズ", state.mouseX, state.mouseY,
+    not state.busy, selected = state.mode == TargetSizeMode)
+  drawButton(font, fm, ui.manualTab, "手動設定", state.mouseX, state.mouseY,
+    not state.busy, selected = state.mode == ManualMode)
   let fpsText =
     if state.inputPath.len > 0:
       formatFps(state.targetFps) & " fps（元: " & formatFps(state.sourceFps) & "）"
     else: "動画選択後に設定できます"
-  discard drawText(font, left + 24, 291, "フレームレート  " & fpsText, Ink, Paper)
-  drawFpsSlider(ui.fpsSlider, state.targetFps, state.sourceFps,
-    state.inputPath.len > 0 and not state.busy)
-  discard drawText(font, left + 24, 375, "音声を含める", Ink, Paper)
-  discard drawText(font, left + 24, 398,
-    "オフにすると映像だけのMP4を作成します", Muted, Paper)
-  drawButton(font, fm, ui.audioToggle,
-    if state.audioEnabled: "音声あり" else: "音声なし",
-    state.mouseX, state.mouseY, not state.busy, selected = state.audioEnabled)
+
+  if state.mode == TargetSizeMode:
+    discard drawText(titleFont, left + 24, 236, $state.targetMb & " MB 以下", Accent, Paper)
+    drawSlider(ui.targetSlider, state.targetMb, 1, 500, not state.busy)
+    for item in [(ui.preset20, 20), (ui.preset50, 50)]:
+      drawButton(font, fm, item[0], $item[1] & " MB", state.mouseX, state.mouseY,
+        not state.busy, selected = state.targetMb == item[1])
+    discard drawText(font, left + 24, 306, "フレームレート  " & fpsText, Ink, Paper)
+    drawFpsSlider(ui.targetFpsSlider, state.targetFps, state.sourceFps,
+      state.inputPath.len > 0 and not state.busy)
+    discard drawText(font, left + 24, 371, "音声を含める", Ink, Paper)
+    discard drawText(font, left + 24, 394,
+      "オフにすると映像だけのMP4を作成します", Muted, Paper)
+    drawButton(font, fm, ui.targetAudioToggle,
+      if state.audioEnabled: "音声あり" else: "音声なし",
+      state.mouseX, state.mouseY, not state.busy and state.sourceHasAudio,
+      selected = state.audioEnabled)
+  else:
+    discard drawText(font, left + 24, 236,
+      "映像ビットレート  " & $state.manualVideoKbps & " kbps（元: " &
+      sourceBitrateText(state.sourceVideoKbps) & "）", Ink, Paper)
+    drawSlider(ui.manualVideoSlider, state.manualVideoKbps, 100, 12000, not state.busy)
+    discard drawText(font, left + 24, 290,
+      "音声ビットレート  " & $state.manualAudioKbps & " kbps（元: " &
+      (if state.sourceHasAudio: sourceBitrateText(state.sourceAudioKbps) else: "音声なし") &
+      "）", Ink, Paper)
+    drawSlider(ui.manualAudioSlider, state.manualAudioKbps, 32, 320,
+      state.audioEnabled and not state.busy)
+    drawButton(font, fm, ui.manualAudioToggle,
+      if state.audioEnabled: "音声あり" else: "音声なし",
+      state.mouseX, state.mouseY, not state.busy and state.sourceHasAudio,
+      selected = state.audioEnabled)
+    discard drawText(font, left + 24, 344, "フレームレート  " & fpsText, Ink, Paper)
+    drawFpsSlider(ui.manualFpsSlider, state.targetFps, state.sourceFps,
+      state.inputPath.len > 0 and not state.busy)
+    let estimate = estimatedOutputBytes(state.duration, state.manualVideoKbps,
+      state.manualAudioKbps, state.audioEnabled)
+    let estimateText =
+      if estimate > 0: "予想サイズ  約 " & formatBytes(estimate)
+      else: "予想サイズ  動画選択後に表示します"
+    discard drawText(font, left + 24, 398, estimateText, Muted, Paper)
 
   discard drawText(font, left + 2, 447, state.status, if state.completed: Success else: Muted, Bg)
   if state.busy:
@@ -535,7 +655,8 @@ proc main =
   cancelRequested.store(false)
 
   let ffmpegReady = findExe("ffmpeg").len > 0 and findExe("ffprobe").len > 0
-  var state = AppState(targetMb: 20, audioEnabled: true,
+  var state = AppState(targetMb: 20, manualVideoKbps: 2000,
+    manualAudioKbps: 128, audioEnabled: false,
     ffmpegReady: ffmpegReady, ffmpegVersion: detectFfmpegVersion(),
     status: "動画を選択してください")
   if not state.ffmpegReady:
@@ -548,6 +669,7 @@ proc main =
   var workerStarted = false
   var drag = NoDrag
   var running = true
+  var firstFrame = true
 
   while running:
     var received = updates.tryRecv()
@@ -574,7 +696,13 @@ proc main =
     if drag != NoDrag and not leftMouseIsDown():
       drag = NoDrag
     var event = default Event
-    while pollEvent(event):
+    var hasEvent =
+      if firstFrame:
+        firstFrame = false
+        pollEvent(event)
+      else:
+        waitEvent(event, if state.busy or drag != NoDrag: 33 else: -1)
+    while hasEvent:
       case event.kind
       of QuitEvent, WindowCloseEvent:
         running = false
@@ -603,19 +731,31 @@ proc main =
           state.selectFile()
       else:
         discard
+      hasEvent = pollEvent(event)
+
+    if not running: break
 
     let pointer = point(state.mouseX, state.mouseY)
+    let overModeControl =
+      if state.mode == TargetSizeMode:
+        ui.targetSlider.contains(pointer) or ui.targetFpsSlider.contains(pointer) or
+        (state.sourceHasAudio and ui.targetAudioToggle.contains(pointer)) or
+        ui.preset20.contains(pointer) or
+        ui.preset50.contains(pointer)
+      else:
+        ui.manualVideoSlider.contains(pointer) or
+        (state.audioEnabled and ui.manualAudioSlider.contains(pointer)) or
+        ui.manualFpsSlider.contains(pointer) or
+        (state.sourceHasAudio and ui.manualAudioToggle.contains(pointer))
     if ui.selectFile.contains(pointer) or ui.openOutput.contains(pointer) or
        ui.compress.contains(pointer) or ui.cancel.contains(pointer) or
-       ui.targetSlider.contains(pointer) or ui.fpsSlider.contains(pointer) or
-       ui.audioToggle.contains(pointer) or ui.preset20.contains(pointer) or
-       ui.preset50.contains(pointer):
+       ui.targetTab.contains(pointer) or ui.manualTab.contains(pointer) or
+       overModeControl:
       setCursor(curHand)
     else:
       setCursor(curArrow)
     drawUi(state, ui, width, height, font, titleFont, fm, titleFm)
     refresh()
-    os.sleep(16)
 
   if state.busy:
     cancelRequested.store(true)

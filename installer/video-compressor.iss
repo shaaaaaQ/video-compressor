@@ -2,6 +2,9 @@
 #define MyAppVersion "0.1.0"
 #define MyAppPublisher "shaaaaaQ"
 #define MyAppExeName "video-compressor.exe"
+#ifndef MyAppSourceName
+  #define MyAppSourceName MyAppExeName
+#endif
 
 [Setup]
 AppId={{83baf6c9-fe72-4738-a905-2c1b89b4eec3}
@@ -35,7 +38,7 @@ Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 Name: "explorer"; Description: "動画の右クリックメニューに「video-compressor で圧縮」を追加する"; GroupDescription: "エクスプローラー連携:"; Flags: unchecked
 
 [Files]
-Source: "..\bin\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\bin\{#MyAppSourceName}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
